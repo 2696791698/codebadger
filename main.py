@@ -20,7 +20,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from src.config import load_config
+from src.config import load_config, load_env_file
 from src import defaults
 from src.tools.core_tools import CPGGenerationQueue
 from src.services import (
@@ -45,6 +45,12 @@ services = {}
 _server_start_time: float = 0.0
 
 logger = logging.getLogger(__name__)
+
+
+def _load_project_env() -> None:
+    """Load project-root .env before configuration resolution."""
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    load_env_file(os.path.join(project_root, ".env"))
 
 
 def _setup_telemetry(config) -> None:
@@ -126,6 +132,7 @@ async def app_lifespan(server: FastMCP):
     _server_start_time = time.monotonic()
 
     # Load configuration
+    _load_project_env()
     config = load_config("config.yaml")
     setup_logging(config.server.log_level)
     logger.info("Starting CodeBadger Server")
@@ -572,6 +579,7 @@ async def root(request):
 
 
 if __name__ == "__main__":
+    _load_project_env()
     config_data = load_config("config.yaml")
     host = config_data.server.host
     port = config_data.server.port

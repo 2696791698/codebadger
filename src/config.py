@@ -17,6 +17,48 @@ from .models import (
 )
 
 
+def load_env_file(env_path: str, override: bool = False) -> bool:
+    """Load simple KEY=VALUE pairs from a .env file into os.environ.
+
+    Existing environment variables win by default, matching common dotenv
+    behavior. This keeps shell-provided overrides higher priority than the
+    checked-in project .env file.
+    """
+    if not env_path or not os.path.exists(env_path):
+        return False
+
+    with open(env_path, "r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            if line.startswith("export "):
+                line = line[7:].strip()
+
+            if "=" not in line:
+                continue
+
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+
+            if not key:
+                continue
+
+            if (
+                len(value) >= 2
+                and value[0] == value[-1]
+                and value[0] in ("'", '"')
+            ):
+                value = value[1:-1]
+
+            if override or key not in os.environ:
+                os.environ[key] = value
+
+    return True
+
+
 def load_config(config_path: Optional[str] = None) -> Config:
     """Load configuration from file or environment variables
     

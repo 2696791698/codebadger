@@ -7,8 +7,9 @@ services:
     image: codebadger-joern-server:latest
     container_name: codebadger-joern-server
     ports:
-      # Expose ports 13371-13870 for Joern servers
-      - "13371-13870:13371-13870"
+      # Host and container ranges can differ. The app auto-discovers the published
+      # host port for each internal Joern server port via Docker inspect.
+      - "${JOERN_HOST_PORT_MIN:-13371}-${JOERN_HOST_PORT_MAX:-13870}:${JOERN_PORT_MIN:-13371}-${JOERN_PORT_MAX:-13870}"
     volumes:
       # Mount playground for CPG storage (shared with host)
       - ./playground:/playground

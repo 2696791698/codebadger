@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import yaml
 
-from src.config import _dict_to_config, _substitute_env_vars, load_config
+from src.config import _dict_to_config, _substitute_env_vars, load_config, load_env_file
 from src.models import Config
 
 
@@ -139,6 +139,47 @@ class TestLoadConfig:
 
         result = _substitute_env_vars(data)
         assert result == data
+
+    def test_load_env_file_sets_missing_variables(self):
+        """Test loading simple values from a .env file"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".env", delete=False) as f:
+            f.write(
+                "\n".join(
+                    [
+                        "# comment",
+                        "PLAIN_KEY=plain",
+                        'DOUBLE_QUOTED="double value"',
+                        "SINGLE_QUOTED='single value'",
+                    ]
+                )
+            )
+            env_path = f.name
+
+        try:
+            with patch.dict(os.environ, {}, clear=True):
+                loaded = load_env_file(env_path)
+
+                assert loaded is True
+                assert os.environ["PLAIN_KEY"] == "plain"
+                assert os.environ["DOUBLE_QUOTED"] == "double value"
+                assert os.environ["SINGLE_QUOTED"] == "single value"
+        finally:
+            os.unlink(env_path)
+
+    def test_load_env_file_does_not_override_existing_env(self):
+        """Test that shell-provided env vars still take precedence"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".env", delete=False) as f:
+            f.write("EXISTING_KEY=from_file\n")
+            env_path = f.name
+
+        try:
+            with patch.dict(os.environ, {"EXISTING_KEY": "from_shell"}, clear=True):
+                loaded = load_env_file(env_path)
+
+                assert loaded is True
+                assert os.environ["EXISTING_KEY"] == "from_shell"
+        finally:
+            os.unlink(env_path)
 
 
 class TestDictToConfig:

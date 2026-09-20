@@ -41,6 +41,7 @@ class JoernServerManager:
         self.docker_client = docker.from_env()
         self._exec_ids: Dict[str, str] = {}
         self._ports: Dict[str, int] = {}
+        self._container_ports: Dict[str, int] = {}
         self._clients: Dict[str, "JoernServerClient"] = {}
 
         # LRU pool
@@ -98,7 +99,7 @@ class JoernServerManager:
 
             self._evict_lru_if_needed()
 
-            port = self.port_manager.allocate_port(codebase_hash)
+            container_port = self.port_manager.allocate_port(codebase_hash)
 
             try:
                 container = self.docker_client.containers.get(self.container_name)
@@ -107,10 +108,12 @@ class JoernServerManager:
                 self.port_manager.release_port(codebase_hash)
                 raise RuntimeError(f"Container {self.container_name} not found")
 
+            host_port = self._get_published_port(container, container_port)
+
             # Ensure no stale JVM is still holding the port before we try to bind it.
             # This closes the race where terminate_server releases the port in our
             # state but the SIGTERM'd JVM hasn't exited yet.
-            self._ensure_port_free(container, port)
+            self._ensure_port_free(container, container_port, host_port)
 
             work_dir = f"/tmp/joern-server-{codebase_hash}"
             log_file = f"/tmp/joern-{codebase_hash}.log"
@@ -120,26 +123,39 @@ class JoernServerManager:
 
             joern_cmd = [
                 "bash", "-c",
-                f"{java_opts_export}mkdir -p '{work_dir}' && cd '{work_dir}' && nohup /opt/joern/joern-cli/joern --server --server-host 0.0.0.0 --server-port {port} > '{log_file}' 2>&1 &"
+                f"{java_opts_export}mkdir -p '{work_dir}' && cd '{work_dir}' && nohup /opt/joern/joern-cli/joern --server --server-host 0.0.0.0 --server-port {container_port} > '{log_file}' 2>&1 &"
             ]
 
-            logger.info(f"Starting Joern server for {codebase_hash} on port {port} inside container {self.container_name}")
+            logger.info(
+                f"Starting Joern server for {codebase_hash} on container port "
+                f"{container_port} (host port {host_port}) inside container {self.container_name}"
+            )
 
             container.exec_run(cmd=joern_cmd, detach=True, stream=False)
 
             self._exec_ids[codebase_hash] = f"exec-{codebase_hash}"
-            self._ports[codebase_hash] = port
+            self._ports[codebase_hash] = host_port
+            self._container_ports[codebase_hash] = container_port
 
             host = self.config.joern.server_host if self.config else "localhost"
-            logger.info(f"Joern server command executed, waiting for server to be ready at {host}:{port}...")
+            logger.info(
+                f"Joern server command executed, waiting for server to be ready at "
+                f"{host}:{host_port}..."
+            )
 
             startup_timeout = self.config.joern.server_startup_timeout if self.config else 120
-            if self._wait_for_server(port, timeout=startup_timeout):
+            if self._wait_for_server(host_port, timeout=startup_timeout):
                 self._touch(codebase_hash)
-                logger.info(f"Joern server for {codebase_hash} started successfully on port {port}")
-                return port
+                logger.info(
+                    f"Joern server for {codebase_hash} started successfully on host "
+                    f"port {host_port}"
+                )
+                return host_port
             else:
-                logger.error(f"Joern server for {codebase_hash} failed to become ready on port {port}")
+                logger.error(
+                    f"Joern server for {codebase_hash} failed to become ready on host "
+                    f"port {host_port}"
+                )
                 try:
                     log_result = container.exec_run(cmd=["cat", log_file], stream=False)
                     if log_result.exit_code == 0:
@@ -147,7 +163,9 @@ class JoernServerManager:
                 except Exception as log_error:
                     logger.warning(f"Could not read log file: {log_error}")
                 self._cleanup_server(codebase_hash)
-                raise RuntimeError(f"Joern server for {codebase_hash} failed to start on port {port}")
+                raise RuntimeError(
+                    f"Joern server for {codebase_hash} failed to start on host port {host_port}"
+                )
 
         except DockerException as e:
             logger.error(f"Docker error while spawning Joern server for {codebase_hash}: {e}", exc_info=True)
@@ -283,14 +301,18 @@ class JoernServerManager:
                 logger.warning(f"No server found for codebase {codebase_hash}")
                 return False
 
-            port = self._ports.get(codebase_hash)
-            logger.info(f"Terminating Joern server for {codebase_hash} on port {port}")
+            host_port = self._ports.get(codebase_hash)
+            container_port = self._container_ports.get(codebase_hash)
+            logger.info(
+                f"Terminating Joern server for {codebase_hash} on host port {host_port} "
+                f"(container port {container_port})"
+            )
 
             try:
                 container = self.docker_client.containers.get(self.container_name)
                 kill_cmd = ["bash", "-c",
-                    f"pkill -f 'joern.*--server-port {port}' || true; "
-                    f"sleep 3; pkill -9 -f 'joern.*--server-port {port}' || true"]
+                    f"pkill -f 'joern.*--server-port {container_port}' || true; "
+                    f"sleep 3; pkill -9 -f 'joern.*--server-port {container_port}' || true"]
                 container.exec_run(cmd=kill_cmd)
             except Exception as e:
                 logger.warning(f"Error killing Joern process: {e}")
@@ -389,8 +411,35 @@ class JoernServerManager:
 
         return False
 
-    def _ensure_port_free(self, container, port: int, wait: int = 8) -> None:
-        """Kill any process still holding *port* inside the container, then wait for it to close."""
+    def _get_published_port(self, container, container_port: int) -> int:
+        """Return the published host port for a container's internal TCP port."""
+        try:
+            container.reload()
+        except Exception:
+            pass
+
+        port_key = f"{container_port}/tcp"
+        ports = container.attrs.get("NetworkSettings", {}).get("Ports", {})
+        bindings = ports.get(port_key) or []
+        if not bindings:
+            raise RuntimeError(
+                f"Container port {container_port} is not published on container "
+                f"{self.container_name}. Check docker-compose port mappings."
+            )
+
+        host_port = bindings[0].get("HostPort")
+        if not host_port:
+            raise RuntimeError(
+                f"Container port {container_port} has no HostPort binding on "
+                f"{self.container_name}."
+            )
+
+        return int(host_port)
+
+    def _ensure_port_free(
+        self, container, container_port: int, host_port: int, wait: int = 8
+    ) -> None:
+        """Kill any process still holding the Joern port inside the container."""
         import socket
         host = self.config.joern.server_host if self.config else "localhost"
 
@@ -398,7 +447,7 @@ class JoernServerManager:
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 s.settimeout(1)
-                result = s.connect_ex((host, port))
+                result = s.connect_ex((host, host_port))
                 s.close()
                 return result == 0
             except Exception:
@@ -407,22 +456,30 @@ class JoernServerManager:
         if not _port_open():
             return  # Nothing to do
 
-        logger.warning(f"Port {port} still in use before spawn — force-killing stale process")
+        logger.warning(
+            f"Container port {container_port} is still mapped on host port {host_port} "
+            f"before spawn; force-killing stale process"
+        )
         try:
             container.exec_run(
-                cmd=["bash", "-c", f"pkill -9 -f 'server-port {port}' || true"],
+                cmd=["bash", "-c", f"pkill -9 -f 'server-port {container_port}' || true"],
             )
         except Exception as e:
-            logger.warning(f"Error force-killing process on port {port}: {e}")
+            logger.warning(f"Error force-killing process on port {container_port}: {e}")
 
         deadline = time.time() + wait
         while time.time() < deadline:
             if not _port_open():
-                logger.info(f"Port {port} is now free")
+                logger.info(
+                    f"Container port {container_port} (host port {host_port}) is now free"
+                )
                 return
             time.sleep(0.5)
 
-        logger.error(f"Port {port} still occupied after {wait}s — spawn may fail with BindException")
+        logger.error(
+            f"Container port {container_port} (host port {host_port}) is still occupied "
+            f"after {wait}s — spawn may fail with BindException"
+        )
 
     def _cleanup_server(self, codebase_hash: str) -> None:
         if codebase_hash in self._exec_ids:
@@ -432,6 +489,8 @@ class JoernServerManager:
             self.port_manager.release_port(codebase_hash)
             del self._ports[codebase_hash]
             logger.debug(f"Cleaned up resources for {codebase_hash} (port {port})")
+        if codebase_hash in self._container_ports:
+            del self._container_ports[codebase_hash]
         if codebase_hash in self._clients:
             client = self._clients[codebase_hash]
             try:
